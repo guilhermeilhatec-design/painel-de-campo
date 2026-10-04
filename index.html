@@ -1504,6 +1504,19 @@ function renderAcessos(){
       O PIN de cada técnico é definido no cadastro, em "Técnicos" (inclui campo de oficina e ação de "Redefinir PIN"). Este controle organiza o uso em equipe; não é uma proteção forte contra acesso mal-intencionado.
     </div>
 
+    <h3 style="margin-top:30px; margin-bottom:10px; font-size:14px;">Base completa (migração entre ambientes)</h3>
+    <div class="toolbar" style="margin-bottom:10px;">
+      <div class="toolbar-left"><span style="font-size:12.5px;color:var(--muted)">Exporta/importa todos os cadastros, contratos, pendências e acessos — use para migrar os dados entre o Claude.ai e uma versão publicada (ex.: GitHub Pages), ou como cópia de segurança completa.</span></div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn secondary" id="btn-export-tudo">Exportar base completa (.json)</button>
+        <button class="btn secondary" id="btn-import-tudo">Importar base completa (.json)</button>
+        <input type="file" id="input-import-tudo" accept="application/json" style="display:none;">
+      </div>
+    </div>
+    <div class="hint" style="margin-top:-2px; margin-bottom:10px; max-width:560px;">
+      Importar substitui TODOS os dados atuais (ferramentas, técnicos, locais, clientes, contratos, pendências, tipos de serviço e acessos) pelos dados do arquivo — não pode ser desfeito.
+    </div>
+
     <h3 style="margin-top:30px; margin-bottom:10px; font-size:14px;">Backup</h3>
     <div class="toolbar" style="margin-bottom:10px;">
       <div class="toolbar-left"><span style="font-size:12.5px;color:var(--muted)">Uma cópia é criada automaticamente no primeiro acesso de cada dia. ${dates.length} backup(s) guardado(s) (últimos 7 dias).</span></div>
@@ -3100,6 +3113,44 @@ function attachViewHandlers(){
     document.getElementById('pf-novo').value = '';
     document.getElementById('pf-confirma').value = '';
   });
+
+  // Base completa (migração entre ambientes: Claude.ai <-> versão publicada)
+  const CHAVES_BASE_COMPLETA = ['tools','technicians','locations','clients','appointments','contracts','pendencias','serviceTypes','adminUsers','settings'];
+  const btnExportTudo = document.getElementById('btn-export-tudo');
+  if(btnExportTudo) btnExportTudo.addEventListener('click', () => {
+    const dump = { exportadoEm: new Date().toISOString() };
+    CHAVES_BASE_COMPLETA.forEach(k => { dump[k] = State[k]; });
+    downloadJSON('base-completa-painel-de-campo-' + todayISO() + '.json', dump);
+  });
+  const btnImportTudo = document.getElementById('btn-import-tudo');
+  const inputImportTudo = document.getElementById('input-import-tudo');
+  if(btnImportTudo && inputImportTudo){
+    btnImportTudo.addEventListener('click', () => inputImportTudo.click());
+    inputImportTudo.addEventListener('change', async () => {
+      const file = inputImportTudo.files[0];
+      inputImportTudo.value = '';
+      if(!file) return;
+      let dados;
+      try{
+        dados = JSON.parse(await file.text());
+      }catch(e){
+        showAlert('Não foi possível ler esse arquivo — verifique se é o .json exportado pela própria tela "Exportar base completa".');
+        return;
+      }
+      const chavesEncontradas = CHAVES_BASE_COMPLETA.filter(k => dados[k] !== undefined);
+      if(chavesEncontradas.length === 0){
+        showAlert('Esse arquivo não parece ser uma base completa exportada pelo sistema.');
+        return;
+      }
+      if(!(await confirmAction('Importar vai SUBSTITUIR todos os dados atuais (' + chavesEncontradas.length + ' área(s) encontradas no arquivo) pelos dados desse arquivo. Essa ação não pode ser desfeita. Continuar?'))) return;
+      chavesEncontradas.forEach(k => { State[k] = dados[k]; });
+      for(const k of chavesEncontradas){
+        await persist(k, 'Importou base completa (' + k + ')');
+      }
+      showAlert('Base importada com sucesso: ' + chavesEncontradas.join(', ') + '.');
+      render();
+    });
+  }
 
   const btnDownloadNow = document.getElementById('btn-download-now');
   if(btnDownloadNow) btnDownloadNow.addEventListener('click', () => {
