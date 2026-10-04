@@ -592,7 +592,7 @@ const STORE_SHARED = true; // dados de equipe: visíveis para todos os usuários
    versão está no ar (ex.: depois de uma atualização, comparar se o selo
    mudou). Aparece num selo discreto no canto inferior direito, em
    qualquer tela, e também em Acessos > Log de ações. */
-const APP_VERSION = '2026-10-04 10:12';
+const APP_VERSION = '2026-10-04 15:30';
 document.getElementById('app-version-tag').textContent = 'v' + APP_VERSION;
 
 /* ============ Ícones (SVG simples, herdam a cor do texto) ============ */
@@ -2789,8 +2789,12 @@ function attachViewHandlers(){
   document.querySelectorAll('[data-reset-pin]').forEach(b => b.addEventListener('click', async () => {
     const tec = findById(State.technicians, b.dataset.resetPin);
     if(!tec) return;
-    if(!(await confirmAction('Redefinir o PIN de ' + tec.nome + '? Ele passará a entrar no sistema só selecionando o nome, sem PIN, até definir um novo.'))) return;
+    const aviso = window.usingFirebaseAuth
+      ? ('Remover o PIN de ' + tec.nome + '? Ele não vai conseguir entrar como técnico até você cadastrar um PIN novo (pode continuar vendo as informações como Visitante nesse meio-tempo).')
+      : ('Redefinir o PIN de ' + tec.nome + '? Ele passará a entrar no sistema só selecionando o nome, sem PIN, até definir um novo.');
+    if(!(await confirmAction(aviso))) return;
     tec.pin = '';
+    tec.temPin = false;
     persist('technicians', 'Redefiniu o PIN de ' + tec.nome);
     render();
   }));
@@ -3109,7 +3113,14 @@ function attachViewHandlers(){
     const u = findById(State.adminUsers, b.dataset.resetAdmin);
     if(!u) return;
     if(!(await confirmAction('Redefinir a senha de ' + u.nome + ' para a senha padrão ("admin123")?'))) return;
-    u.senha = 'admin123';
+    if(window.usingFirebaseAuth){
+      u.authVersao = (u.authVersao || 1) + 1;
+      try{ await criarContaAuthSecundaria(emailAuthAdmin(u), 'admin123'); }
+      catch(e){ showAlert('Não foi possível redefinir a senha agora. Verifique a conexão e tente de novo.'); return; }
+      delete u.senha;
+    } else {
+      u.senha = 'admin123';
+    }
     persist('adminUsers', 'Redefiniu a senha de ' + u.nome);
     render();
   }));
@@ -3123,11 +3134,22 @@ function attachViewHandlers(){
     const atual = document.getElementById('pf-atual').value;
     const novo = document.getElementById('pf-novo').value.trim();
     const conf = document.getElementById('pf-confirma').value.trim();
-    const pinAtual = tec.pin || '';
-    if(atual !== pinAtual){ msg.style.color = 'var(--nok)'; msg.textContent = 'PIN atual incorreto.'; return; }
     if(novo !== conf){ msg.style.color = 'var(--nok)'; msg.textContent = 'Os PINs não coincidem.'; return; }
-    tec.pin = novo;
-    persist('technicians');
+    if(window.usingFirebaseAuth){
+      if(!novo){ msg.style.color = 'var(--nok)'; msg.textContent = 'Defina um PIN novo (nesta versão hospedada, entrar sem PIN não é mais possível).'; return; }
+      const ok = await verificarSenhaAuth(emailAuthTecnico(tec), atual);
+      if(!ok){ msg.style.color = 'var(--nok)'; msg.textContent = 'PIN atual incorreto.'; return; }
+      try{ await substituirContaAuthConhecendoAntiga(emailAuthTecnico(tec), atual, novo); }
+      catch(e){ msg.style.color = 'var(--nok)'; msg.textContent = 'Não foi possível atualizar o PIN agora. Tente de novo.'; return; }
+      delete tec.pin;
+      tec.temPin = true;
+      persist('technicians');
+    } else {
+      const pinAtual = tec.pin || '';
+      if(atual !== pinAtual){ msg.style.color = 'var(--nok)'; msg.textContent = 'PIN atual incorreto.'; return; }
+      tec.pin = novo;
+      persist('technicians');
+    }
     msg.style.color = 'var(--ok)'; msg.textContent = 'PIN atualizado com sucesso.';
     document.getElementById('pf-atual').value = '';
     document.getElementById('pf-novo').value = '';
@@ -4642,6 +4664,17 @@ function openSimpleModal(view, id){
         </div>
       `;
     }
+    if(view === 'tecnicos' && f.k === 'pin' && window.usingFirebaseAuth){
+      const placeholder = (editing && editing.temPin)
+        ? 'PIN já definido — digite um valor novo só se quiser trocar'
+        : 'Defina um PIN de acesso para ele entrar no sistema';
+      return `
+        <div class="field">
+          <label for="sf-${i}">${f.label}</label>
+          <input type="text" id="sf-${i}" placeholder="${placeholder}" value="">
+        </div>
+      `;
+    }
     return `
       <div class="field">
         <label for="sf-${i}">${f.label}</label>
@@ -4672,11 +4705,29 @@ function openSimpleModal(view, id){
     fields.forEach((f,i) => values[f.k] = document.getElementById('sf-'+i).value.trim());
     if(!values[fields[0].k]){ showAlert('Preencha o campo "' + fields[0].label + '".'); return; }
 
+    const usaPinFirebase = view === 'tecnicos' && window.usingFirebaseAuth;
+    const novoPin = usaPinFirebase ? values.pin : null;
+    if(usaPinFirebase) delete values.pin; // tratado separadamente abaixo
+
+    let item;
     if(editing){
       Object.assign(editing, values);
+      item = editing;
     } else {
-      State[cfg.key].push({ id: uid(view.slice(0,3)), ...values });
+      item = { id: uid(view.slice(0,3)), ...values };
+      State[cfg.key].push(item);
     }
+
+    if(usaPinFirebase && novoPin){
+      // Em branco = não trocar (o PIN atual continua igual). Para remover
+      // o PIN de verdade, existe o botão "Redefinir PIN" na listagem.
+      if(editing) item.pinVersao = (item.pinVersao || 1) + 1;
+      try{ await criarContaAuthSecundaria(emailAuthTecnico(item), novoPin); }
+      catch(e){ showAlert('Não foi possível criar o login deste técnico agora. Verifique a conexão e tente de novo.'); return; }
+      item.temPin = true;
+      delete item.pin;
+    }
+
     persist(cfg.key, (editing ? 'Editou ' : 'Cadastrou ') + cfg.label + ': ' + values[fields[0].k]);
     closeModal();
     render();
@@ -4870,12 +4921,29 @@ function openAdminUserModal(id){
     if(!editing && !senha){ showAlert('Defina uma senha.'); return; }
     if(senha && senha.length < 4){ showAlert('A senha deve ter ao menos 4 caracteres.'); return; }
 
+    let item;
     if(editing){
       editing.nome = nome;
       editing.email = email;
-      if(senha) editing.senha = senha;
+      item = editing;
     } else {
-      State.adminUsers.push({ id: uid('usr'), nome, email, senha });
+      item = { id: uid('usr'), nome, email };
+      State.adminUsers.push(item);
+    }
+    if(senha){
+      if(window.usingFirebaseAuth){
+        if(editing){
+          // Sem servidor próprio, não é possível trocar a senha de outra
+          // conta sabendo só a senha nova: criamos uma conta nova (e a
+          // tela de login passa a usar essa). A conta antiga fica órfã.
+          item.authVersao = (item.authVersao || 1) + 1;
+        }
+        try{ await criarContaAuthSecundaria(emailAuthAdmin(item), senha); }
+        catch(e){ showAlert('Não foi possível criar o login deste administrador agora. Verifique a conexão e tente de novo.'); return; }
+        delete item.senha;
+      } else {
+        item.senha = senha;
+      }
     }
     persist('adminUsers', (editing ? 'Editou ' : 'Cadastrou ') + 'administrador: ' + nome);
     closeModal();
@@ -5247,33 +5315,53 @@ function renderLoginScreen(){
     renderFields();
   }));
 
-  document.getElementById('login-btn').addEventListener('click', () => {
+  document.getElementById('login-btn').addEventListener('click', async () => {
     const msg = document.getElementById('login-msg');
     msg.textContent = '';
-    if(role === 'admin'){
-      const userId = document.getElementById('login-admin').value;
-      const senha = document.getElementById('login-senha').value;
-      if(!userId){ msg.textContent = 'Selecione o administrador.'; return; }
-      const user = findById(State.adminUsers, userId);
-      if(!user || senha !== user.senha){ msg.textContent = 'Senha incorreta.'; return; }
-      State.session = { role: 'admin', userId: user.id };
-    } else if(role === 'visitante'){
-      State.session = { role: 'visitante' };
-      State.calFilter = 'general';
-    } else {
-      const tecId = document.getElementById('login-tecnico').value;
-      const pin = document.getElementById('login-pin').value;
-      if(!tecId){ msg.textContent = 'Selecione seu nome.'; return; }
-      const tec = findById(State.technicians, tecId);
-      if(tec.pin && tec.pin !== pin){ msg.textContent = 'PIN incorreto.'; return; }
-      State.session = { role: 'tecnico', tecnicoId: tecId };
-      State.calFilter = 'own';
+    const btn = document.getElementById('login-btn');
+    btn.disabled = true;
+    try{
+      if(role === 'admin'){
+        const userId = document.getElementById('login-admin').value;
+        const senha = document.getElementById('login-senha').value;
+        if(!userId){ msg.textContent = 'Selecione o administrador.'; return; }
+        const user = findById(State.adminUsers, userId);
+        if(!user){ msg.textContent = 'Senha incorreta.'; return; }
+        if(window.usingFirebaseAuth){
+          try{ await firebase.auth().signInWithEmailAndPassword(emailAuthAdmin(user), senhaParaFirebase(senha)); }
+          catch(e){ msg.textContent = 'Senha incorreta.'; return; }
+        } else {
+          if(senha !== user.senha){ msg.textContent = 'Senha incorreta.'; return; }
+        }
+        State.session = { role: 'admin', userId: user.id };
+      } else if(role === 'visitante'){
+        // Fora do Claude.ai, a própria sessão anônima aberta ao carregar a
+        // página já serve para o modo visitante (só leitura).
+        State.session = { role: 'visitante' };
+        State.calFilter = 'general';
+      } else {
+        const tecId = document.getElementById('login-tecnico').value;
+        const pin = document.getElementById('login-pin').value;
+        if(!tecId){ msg.textContent = 'Selecione seu nome.'; return; }
+        const tec = findById(State.technicians, tecId);
+        if(!tec){ msg.textContent = 'PIN incorreto.'; return; }
+        if(window.usingFirebaseAuth){
+          try{ await firebase.auth().signInWithEmailAndPassword(emailAuthTecnico(tec), senhaParaFirebase(pin)); }
+          catch(e){ msg.textContent = 'PIN incorreto (ou você ainda não tem um PIN definido — peça ao administrador).'; return; }
+        } else {
+          if(tec.pin && tec.pin !== pin){ msg.textContent = 'PIN incorreto.'; return; }
+        }
+        State.session = { role: 'tecnico', tecnicoId: tecId };
+        State.calFilter = 'own';
+      }
+      enterApp();
+    } finally {
+      btn.disabled = false;
     }
-    enterApp();
   });
 }
 
-function enterApp(){
+async function enterApp(){
   document.getElementById('login-root').style.display = 'none';
   document.querySelector('.app').style.display = 'flex';
   State.view = 'calendario';
@@ -5285,6 +5373,20 @@ function enterApp(){
   startPolling();
   maybeCreateDailySnapshot();
   registrarLog('Entrou no sistema');
+  // Agora que a sessão é "de verdade" (não anônima), a gravação no banco é
+  // permitida: é o momento seguro de apagar a senha/PIN em texto puro que
+  // ainda estivesse guardada de antes deste ajuste de segurança.
+  if(window.usingFirebaseAuth){
+    try{
+      if(isAdmin()){
+        const u = findById(State.adminUsers, State.session.userId);
+        if(u && u.senha){ delete u.senha; persist('adminUsers'); }
+      } else if(isTecnico()){
+        const t = findById(State.technicians, State.session.tecnicoId);
+        if(t && t.pin){ delete t.pin; t.temPin = true; persist('technicians'); }
+      }
+    }catch(e){ console.error('Não foi possível concluir a limpeza de credenciais antigas', e); }
+  }
 }
 
 function logout(){
@@ -5293,6 +5395,11 @@ function logout(){
   State.session = null;
   document.querySelector('.app').style.display = 'none';
   document.getElementById('login-root').style.display = 'flex';
+  if(window.usingFirebaseAuth){
+    // Volta para uma sessão anônima (só leitura) para que a tela de login
+    // consiga mostrar a lista de nomes de novo.
+    firebase.auth().signOut().then(() => firebase.auth().signInAnonymously()).catch(() => {});
+  }
   renderLoginScreen();
 }
 
@@ -5360,7 +5467,14 @@ function carregarScriptExterno(src){
 async function ativarArmazenamentoFirebase(){
   await carregarScriptExterno('https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js');
   await carregarScriptExterno('https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js');
+  await carregarScriptExterno('https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js');
   firebase.initializeApp(FIREBASE_CONFIG);
+  window.usingFirebaseAuth = true;
+  // Sessão anônima só para conseguir ler a lista de nomes da tela de login
+  // (ela é obrigatória assim que as regras do banco passam a exigir login).
+  // Essa sessão não dá nenhum poder de gravação — isso é garantido pelas
+  // regras do Firestore, não só pelo código aqui.
+  await firebase.auth().signInAnonymously();
   const colecao = firebase.firestore().collection('painelDeCampo');
   window.storage = {
     get: async (key) => {
@@ -5372,6 +5486,81 @@ async function ativarArmazenamentoFirebase(){
       return true;
     },
   };
+}
+
+/* ============ Autenticação (Firebase Auth) ============
+   Só entra em ação quando ativarArmazenamentoFirebase() ligou o
+   armazenamento em nuvem (window.usingFirebaseAuth). Dentro do Claude.ai
+   a aplicação continua comparando senha/PIN como sempre comparou — nada
+   muda nesse caminho.
+
+   Como não há servidor próprio, usamos o próprio Firebase Authentication
+   como "cofre" das senhas (ele nunca devolve a senha de ninguém pelo
+   código do navegador) em vez de guardar senha/PIN em texto no banco.
+   Cada administrador/técnico tem uma conta de login "disfarçada" com um
+   e-mail interno (nunca usado para enviar e-mail de verdade), amarrada
+   ao id do cadastro dele.
+
+   Limitação conhecida e aceita: como não existe um servidor para revogar
+   contas de terceiros, uma troca de senha/PIN feita pelo próprio usuário
+   (que informa a senha/PIN atual) invalida a anterior imediatamente; já
+   uma redefinição feita por um administrador (que não sabe a senha/PIN
+   anterior) cria uma conta nova e troca qual conta a tela de login tenta
+   usar, mas não consegue apagar a conta antiga no Firebase — ela fica
+   órfã e tecnicamente ainda existiria para quem soubesse a senha/PIN
+   antiga e o endereço técnico interno dela. */
+function authSecundario(){
+  try{ return firebase.app('secundario').auth(); }
+  catch(e){ return firebase.initializeApp(FIREBASE_CONFIG, 'secundario').auth(); }
+}
+function senhaParaFirebase(s){
+  // O Firebase exige ao menos 6 caracteres. Para não obrigar administradores
+  // e técnicos a usarem senhas/PINs mais longos do que já usam, preenchemos
+  // por baixo dos panos quando necessário — sem reduzir a senha/PIN real
+  // que a pessoa digita.
+  s = String(s || '');
+  return s.length >= 6 ? s : (s + '-pdc-' + s).slice(0, 24);
+}
+function emailAuthAdmin(u){ return 'admin-' + u.id + '-v' + (u.authVersao || 1) + '@painel-de-campo.app'; }
+function emailAuthTecnico(t){ return 'tec-' + t.id + '-v' + (t.pinVersao || 1) + '@painel-de-campo.app'; }
+async function criarContaAuthSecundaria(email, senha){
+  const auth = authSecundario();
+  await auth.createUserWithEmailAndPassword(email, senhaParaFirebase(senha));
+  await auth.signOut();
+}
+async function substituirContaAuthConhecendoAntiga(email, senhaAntiga, senhaNova){
+  const auth = authSecundario();
+  try{
+    await auth.signInWithEmailAndPassword(email, senhaParaFirebase(senhaAntiga));
+    await auth.currentUser.delete();
+  }catch(e){ /* mesmo sem conseguir confirmar/apagar a conta antiga, seguimos para criar a nova */ }
+  await auth.createUserWithEmailAndPassword(email, senhaParaFirebase(senhaNova));
+  await auth.signOut();
+}
+async function verificarSenhaAuth(email, senha){
+  const auth = authSecundario();
+  try{
+    await auth.signInWithEmailAndPassword(email, senhaParaFirebase(senha));
+    await auth.signOut();
+    return true;
+  }catch(e){ return false; }
+}
+/* Cria, na primeira vez que a aplicação nova carregar, uma conta de login
+   no Firebase para quem ainda só tinha senha/PIN em texto (dados antigos,
+   de antes deste ajuste). Não apaga o campo de texto ainda — isso só
+   acontece com segurança depois que a própria pessoa faz login (ver
+   enterApp), porque só então temos permissão de gravação no banco. */
+async function criarContasAuthFaltantes(){
+  for(const u of State.adminUsers){
+    if(!u.senha) continue;
+    try{ await criarContaAuthSecundaria(emailAuthAdmin(u), u.senha); }
+    catch(e){ /* já deve existir de uma tentativa anterior — ignora */ }
+  }
+  for(const t of State.technicians){
+    if(!t.pin) continue;
+    try{ await criarContaAuthSecundaria(emailAuthTecnico(t), t.pin); }
+    catch(e){ /* já deve existir de uma tentativa anterior — ignora */ }
+  }
 }
 
 /* ============ Init ============ */
@@ -5395,6 +5584,10 @@ async function ativarArmazenamentoFirebase(){
     }
   }
   await loadAll();
+  if(window.usingFirebaseAuth){
+    try{ await criarContasAuthFaltantes(); }
+    catch(e){ console.error('Não foi possível preparar contas de login no Firebase', e); }
+  }
   renderLoginScreen();
 })();
 </script>
