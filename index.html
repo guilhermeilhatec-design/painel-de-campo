@@ -5260,23 +5260,68 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+/* ============ Armazenamento fora do Claude.ai (Firebase) ============
+   Dentro do Claude.ai existe "window.storage" (get/set) pronto. Fora
+   dali — por exemplo, este mesmo arquivo hospedado no GitHub Pages —
+   esse recurso não existe, então aqui a gente substitui por um banco
+   de dados na nuvem (Firebase Firestore, camada gratuita do Google),
+   guardando cada "chave" (técnicos, clientes, agendamentos etc.) como
+   um documento. O resto do app continua chamando window.storage.get/
+   set exatamente como antes — só essa parte muda por baixo, então
+   não foi preciso tocar em mais nada do código. */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyAL6t-EcRPD7HCWsWOivNCikDa4fgwlIEo",
+  authDomain: "painel-de-campo.firebaseapp.com",
+  projectId: "painel-de-campo",
+  storageBucket: "painel-de-campo.firebasestorage.app",
+  messagingSenderId: "344354045187",
+  appId: "1:344354045187:web:09cc11bc4ce593c5bb3d36",
+};
+function carregarScriptExterno(src){
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error('Falha ao carregar ' + src));
+    document.head.appendChild(s);
+  });
+}
+async function ativarArmazenamentoFirebase(){
+  await carregarScriptExterno('https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js');
+  await carregarScriptExterno('https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js');
+  firebase.initializeApp(FIREBASE_CONFIG);
+  const colecao = firebase.firestore().collection('painelDeCampo');
+  window.storage = {
+    get: async (key) => {
+      const doc = await colecao.doc(key).get();
+      return { value: doc.exists ? doc.data().value : undefined };
+    },
+    set: async (key, value) => {
+      await colecao.doc(key).set({ value });
+      return true;
+    },
+  };
+}
+
 /* ============ Init ============ */
 (async function init(){
   if(typeof window.storage === 'undefined' || !window.storage || typeof window.storage.get !== 'function'){
-    document.body.innerHTML = `
-      <div style="min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; font-family:'IBM Plex Sans', sans-serif; background:#EEF1F0;">
-        <div style="max-width:440px; background:#fff; border-radius:8px; padding:28px 26px; box-shadow:0 12px 40px rgba(20,32,36,0.15);">
-          <h2 style="margin:0 0 12px 0; font-size:17px; color:#16262B;">Este arquivo não consegue salvar dados aqui</h2>
-          <p style="font-size:13.5px; line-height:1.6; color:#4B5C61; margin:0 0 12px 0;">
-            Isso acontece quando o arquivo HTML é aberto diretamente no navegador (baixado e aberto por duplo clique). Nesse modo, não existe conexão com o armazenamento — por isso tudo que você cadastra desaparece na próxima vez que abrir.
-          </p>
-          <p style="font-size:13.5px; line-height:1.6; color:#4B5C61; margin:0;">
-            Para os dados ficarem salvos de verdade, abra e use este sistema <strong>dentro do Claude.ai</strong>, pelo artefato (ou pelo link publicado), em vez do arquivo baixado no seu computador.
-          </p>
+    try{
+      await ativarArmazenamentoFirebase();
+    }catch(e){
+      console.error('Não foi possível conectar ao armazenamento (Firebase)', e);
+      document.body.innerHTML = `
+        <div style="min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; font-family:'IBM Plex Sans', sans-serif; background:#EEF1F0;">
+          <div style="max-width:440px; background:#fff; border-radius:8px; padding:28px 26px; box-shadow:0 12px 40px rgba(20,32,36,0.15);">
+            <h2 style="margin:0 0 12px 0; font-size:17px; color:#16262B;">Não foi possível conectar ao armazenamento</h2>
+            <p style="font-size:13.5px; line-height:1.6; color:#4B5C61; margin:0;">
+              Verifique sua conexão com a internet e tente de novo em alguns instantes. Se o problema continuar, pode ser necessário revisar a configuração do banco de dados (Firebase).
+            </p>
+          </div>
         </div>
-      </div>
-    `;
-    return;
+      `;
+      return;
+    }
   }
   await loadAll();
   renderLoginScreen();
