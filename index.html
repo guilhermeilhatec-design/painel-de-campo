@@ -117,6 +117,15 @@
     overflow:hidden;
   }
 
+  /* Selo de versão — canto inferior direito, visível em qualquer tela
+     (login, app, modal) para saber qual versão está no ar. */
+  .app-version-tag{
+    position:fixed; right:10px; bottom:8px; z-index:50;
+    font-size:10.5px; color:var(--muted); background:rgba(255,255,255,0.85);
+    padding:2px 7px; border-radius:var(--radius-s); pointer-events:none;
+    font-family:'IBM Plex Mono', monospace;
+  }
+
   /* Barra lateral recolhida: só ícones */
   .sidebar.collapsed{ width:64px; }
   .sidebar.collapsed .brand{ justify-content:center; padding-left:0; padding-right:0; }
@@ -572,9 +581,19 @@
 
 <div id="modal-root"></div>
 
+<div class="app-version-tag" id="app-version-tag"></div>
+
 <script>
 /* ============ Estado & persistência ============ */
 const STORE_SHARED = true; // dados de equipe: visíveis para todos os usuários deste app
+
+/* ============ Versão do sistema ============
+   Atualizada manualmente a cada publicação, pra dar pra confirmar qual
+   versão está no ar (ex.: depois de uma atualização, comparar se o selo
+   mudou). Aparece num selo discreto no canto inferior direito, em
+   qualquer tela, e também em Acessos > Log de ações. */
+const APP_VERSION = '2026-10-04 10:12';
+document.getElementById('app-version-tag').textContent = 'v' + APP_VERSION;
 
 /* ============ Ícones (SVG simples, herdam a cor do texto) ============ */
 const ICONS = {
@@ -1542,6 +1561,7 @@ function renderAcessos(){
       <div class="toolbar-left"><span style="font-size:12.5px;color:var(--muted)">${(State.logs||[]).length} registro(s) no total · ${logsFiltrados.length} exibido(s)</span></div>
       ${(State.logs||[]).length > 0 ? '<button class="btn secondary" id="btn-clear-log">Limpar log</button>' : ''}
     </div>
+    <div class="hint" style="margin-top:-2px; margin-bottom:12px;">Versão desta aplicação: <span class="mono">${escapeHtml(APP_VERSION)}</span></div>
     <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; margin-bottom:12px;">
       <div class="field" style="margin:0;">
         <label for="lf-de" style="font-size:11px;">De</label>
