@@ -592,7 +592,7 @@ const STORE_SHARED = true; // dados de equipe: visíveis para todos os usuários
    versão está no ar (ex.: depois de uma atualização, comparar se o selo
    mudou). Aparece num selo discreto no canto inferior direito, em
    qualquer tela, e também em Acessos > Log de ações. */
-const APP_VERSION = '2026-10-04 15:30';
+const APP_VERSION = '2026-10-04 21:50';
 document.getElementById('app-version-tag').textContent = 'v' + APP_VERSION;
 
 /* ============ Ícones (SVG simples, herdam a cor do texto) ============ */
@@ -1989,6 +1989,7 @@ function renderCalendario(){
       </div>
       <div style="display:flex; align-items:center; gap:10px;">
         <button type="button" class="btn secondary small" id="btn-export-ics" title="Gera um arquivo .ics com a agenda visível nesta tela, para importar no Google Agenda, Outlook ou similar">Exportar agenda (.ics)</button>
+        ${(window.usingFirebaseAuth && !isVisitante()) ? '<button type="button" class="btn secondary small" id="btn-sync-outlook" title="Envia a agenda visível nesta tela para um calendário chamado Painel de Campo no seu Outlook">Sincronizar com Outlook</button>' : ''}
         <div class="cal-zoom" title="Ajustar tamanho do texto do calendário">
           <button type="button" id="cal-zoom-out">A−</button>
           <span class="cal-zoom-label">${Math.round((State.calFontScale||1.1)*100)}%</span>
@@ -2156,6 +2157,165 @@ function exportarAgendaICS(){
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+/* ============ Sincronizar com o Outlook (Microsoft Graph) ============
+   Envia a agenda visível na tela para um calendário próprio chamado
+   "Painel de Campo" dentro do Outlook da pessoa. É uma via de mão única
+   (Painel -> Outlook): a cada sincronização o conteúdo desse calendário
+   é substituído pelo que está na tela agora, então ele não deve ser
+   usado para compromissos pessoais. Login Microsoft feito aqui mesmo no
+   navegador (OAuth com PKCE), sem servidor nosso no meio. Só disponível
+   na versão hospedada (precisa de um endereço próprio para o retorno do
+   login). Requer o "ID do aplicativo" registrado no Azure — ver
+   OUTLOOK_CLIENT_ID. */
+const OUTLOOK_CLIENT_ID = '';
+const OUTLOOK_NOME_CALENDARIO = 'Painel de Campo';
+const OUTLOOK_FUSO = 'America/Sao_Paulo';
+let outlookToken = null; // { valor, expiraEm }
+
+function base64Url(bytes){
+  let s = '';
+  bytes.forEach(b => { s += String.fromCharCode(b); });
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+async function outlookGerarPKCE(){
+  const rnd = crypto.getRandomValues(new Uint8Array(48));
+  const verifier = base64Url(rnd);
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return { verifier, challenge: base64Url(new Uint8Array(hash)) };
+}
+function outlookRedirectUri(){ return location.origin + location.pathname; }
+async function outlookObterToken(){
+  if(outlookToken && outlookToken.expiraEm > Date.now() + 60000) return outlookToken.valor;
+  const { verifier, challenge } = await outlookGerarPKCE();
+  const estado = base64Url(crypto.getRandomValues(new Uint8Array(16)));
+  const escopo = 'https://graph.microsoft.com/Calendars.ReadWrite';
+  const url = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?' + new URLSearchParams({
+    client_id: OUTLOOK_CLIENT_ID, response_type: 'code', redirect_uri: outlookRedirectUri(),
+    response_mode: 'fragment', scope: escopo, code_challenge: challenge,
+    code_challenge_method: 'S256', state: estado, prompt: 'select_account',
+  }).toString();
+  const popup = window.open(url, 'outlook-login', 'width=520,height=680');
+  if(!popup) throw new Error('O navegador bloqueou a janela de login. Libere pop-ups para este site e tente de novo.');
+  // Quando a Microsoft devolve para o nosso endereço, a janela vira "mesma origem"
+  // e conseguimos ler o código no final do endereço.
+  const codigo = await new Promise((resolve, reject) => {
+    const inicio = Date.now();
+    const t = setInterval(() => {
+      if(popup.closed){ clearInterval(t); reject(new Error('Login cancelado.')); return; }
+      if(Date.now() - inicio > 180000){ clearInterval(t); try{ popup.close(); }catch(e){} reject(new Error('Tempo esgotado no login.')); return; }
+      try{
+        const h = popup.location.hash || '';
+        if(popup.location.origin === location.origin && /[#&](code|error)=/.test(h)){
+          const p = new URLSearchParams(h.replace(/^#/, ''));
+          clearInterval(t); popup.close();
+          if(p.get('error')) reject(new Error(p.get('error_description') || p.get('error')));
+          else if(p.get('state') !== estado) reject(new Error('Resposta de login inválida.'));
+          else resolve(p.get('code'));
+        }
+      }catch(e){ /* ainda no domínio da Microsoft — aguarda */ }
+    }, 300);
+  });
+  const resp = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: OUTLOOK_CLIENT_ID, grant_type: 'authorization_code', code: codigo,
+      redirect_uri: outlookRedirectUri(), code_verifier: verifier, scope: escopo,
+    }).toString(),
+  });
+  const dados = await resp.json();
+  if(!resp.ok || !dados.access_token) throw new Error(dados.error_description || 'Não foi possível concluir o login Microsoft.');
+  outlookToken = { valor: dados.access_token, expiraEm: Date.now() + (dados.expires_in || 3600) * 1000 };
+  return outlookToken.valor;
+}
+async function graphFetch(token, caminho, opcoes){
+  const resp = await fetch(caminho.startsWith('http') ? caminho : 'https://graph.microsoft.com/v1.0' + caminho, {
+    ...opcoes,
+    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', ...((opcoes && opcoes.headers) || {}) },
+  });
+  if(!resp.ok){
+    let detalhe = '';
+    try{ detalhe = (await resp.json()).error.message; }catch(e){}
+    throw new Error('Microsoft respondeu ' + resp.status + (detalhe ? ': ' + detalhe : ''));
+  }
+  return resp.status === 204 ? null : resp.json();
+}
+async function graphBatch(token, requisicoes){
+  for(let i = 0; i < requisicoes.length; i += 20){
+    const fatia = requisicoes.slice(i, i + 20).map((r, j) => ({ id: String(j + 1), ...r }));
+    const res = await graphFetch(token, '/$batch', { method: 'POST', body: JSON.stringify({ requests: fatia }) });
+    const falhas = (res.responses || []).filter(r => r.status >= 400 && r.status !== 404);
+    if(falhas.length) throw new Error('Alguns itens não foram aceitos pelo Outlook (' + falhas[0].status + ').');
+  }
+}
+function coletarEventosOutlook(){
+  const eventos = [];
+  const corpo = (cliente, tec, obs) => [
+    cliente ? 'Cliente: ' + clienteNomeAgenda(cliente) : '',
+    tec ? 'Técnico: ' + tec.nome : '',
+    obs ? 'Observações: ' + obs : '',
+  ].filter(Boolean).join('\n');
+  getVisibleAppointments().forEach(a => {
+    const diaTodo = !!a.diaTodo;
+    eventos.push({
+      subject: buildTitle(a),
+      body: { contentType: 'text', content: corpo(findById(State.clients, a.clienteId), findById(State.technicians, a.tecnicoId), a.observacoes) },
+      isAllDay: diaTodo,
+      start: { dateTime: diaTodo ? a.data + 'T00:00:00' : a.data + 'T' + (a.horaInicio || '00:00') + ':00', timeZone: OUTLOOK_FUSO },
+      end: { dateTime: diaTodo ? addDaysIso(a.dataFim || a.data, 1) + 'T00:00:00' : (a.dataFim || a.data) + 'T' + (a.horaFim || a.horaInicio || '00:00') + ':00', timeZone: OUTLOOK_FUSO },
+      location: a.cidade ? { displayName: a.cidade } : undefined,
+      showAs: a.status === 'OK' ? 'busy' : 'tentative',
+    });
+  });
+  getVisibleScheduledPendencias().forEach(p => {
+    eventos.push({
+      subject: buildTituloPendencia(p),
+      body: { contentType: 'text', content: corpo(findById(State.clients, p.clienteId), findById(State.technicians, p.tecnicoId), p.observacoes) },
+      isAllDay: true,
+      start: { dateTime: p.dataAgendada + 'T00:00:00', timeZone: OUTLOOK_FUSO },
+      end: { dateTime: addDaysIso(p.dataAgendadaFim || p.dataAgendada, 1) + 'T00:00:00', timeZone: OUTLOOK_FUSO },
+      location: p.cidade ? { displayName: p.cidade } : undefined,
+      showAs: p.confirmado ? 'busy' : 'tentative',
+    });
+  });
+  return eventos;
+}
+async function sincronizarOutlook(){
+  if(!OUTLOOK_CLIENT_ID){
+    showAlert('A integração com o Outlook ainda não foi configurada: falta registrar o aplicativo no Azure e informar o "ID do aplicativo" no sistema.');
+    return;
+  }
+  const eventos = coletarEventosOutlook();
+  if(eventos.length === 0 && !(await confirmAction('Não há nada agendado na tela agora. Continuar mesmo assim vai esvaziar o calendário "' + OUTLOOK_NOME_CALENDARIO + '" no seu Outlook. Continuar?'))) return;
+  if(!(await confirmAction('Enviar ' + eventos.length + ' item(ns) da agenda atual para o calendário "' + OUTLOOK_NOME_CALENDARIO + '" do seu Outlook? O conteúdo anterior desse calendário será substituído (não use-o para compromissos pessoais).'))) return;
+  const btn = document.getElementById('btn-sync-outlook');
+  const textoOriginal = btn ? btn.textContent : '';
+  if(btn){ btn.disabled = true; btn.textContent = 'Sincronizando…'; }
+  try{
+    const token = await outlookObterToken();
+    const lista = await graphFetch(token, '/me/calendars?$top=100&$select=id,name');
+    let cal = (lista.value || []).find(c => c.name === OUTLOOK_NOME_CALENDARIO);
+    if(!cal) cal = await graphFetch(token, '/me/calendars', { method: 'POST', body: JSON.stringify({ name: OUTLOOK_NOME_CALENDARIO }) });
+    // Apaga o que já estava no calendário do Painel e recria tudo (evita duplicar e dispensa guardar mapeamentos).
+    let proxima = '/me/calendars/' + cal.id + '/events?$top=100&$select=id';
+    while(proxima){
+      const pagina = await graphFetch(token, proxima);
+      const ids = (pagina.value || []).map(e => e.id);
+      if(ids.length) await graphBatch(token, ids.map(id => ({ method: 'DELETE', url: '/me/events/' + id })));
+      proxima = pagina['@odata.nextLink'] || null;
+    }
+    await graphBatch(token, eventos.map(ev => ({
+      method: 'POST', url: '/me/calendars/' + cal.id + '/events',
+      headers: { 'Content-Type': 'application/json' }, body: ev,
+    })));
+    registrarLog('Sincronizou ' + eventos.length + ' item(ns) da agenda com o Outlook');
+    showAlert('Pronto! ' + eventos.length + ' item(ns) enviados para o calendário "' + OUTLOOK_NOME_CALENDARIO + '" no seu Outlook.');
+  }catch(e){
+    showAlert('Não foi possível sincronizar com o Outlook. ' + (e && e.message ? e.message : ''));
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = textoOriginal; }
+  }
 }
 async function desagendarPendencia(id){
   const p = findById(State.pendencias, id);
@@ -3050,6 +3210,8 @@ function attachViewHandlers(){
   document.querySelectorAll('[data-del-appt]').forEach(b => b.addEventListener('click', () => deleteAppt(b.dataset.delAppt)));
   const btnExportIcs = document.getElementById('btn-export-ics');
   if(btnExportIcs) btnExportIcs.addEventListener('click', exportarAgendaICS);
+  const btnSyncOutlook = document.getElementById('btn-sync-outlook');
+  if(btnSyncOutlook) btnSyncOutlook.addEventListener('click', sincronizarOutlook);
 
   document.querySelectorAll('#agenda-filter button').forEach(b => b.addEventListener('click', () => {
     State.calFilter = b.dataset.filter;
@@ -5583,6 +5745,8 @@ async function criarContasAuthFaltantes(){
       return;
     }
   }
+  // Janela de login Microsoft (aberta pelo próprio app): só devolve o código para a janela principal.
+  if(window.opener && /[#&](code|error)=/.test(location.hash)) return;
   await loadAll();
   if(window.usingFirebaseAuth){
     try{ await criarContasAuthFaltantes(); }
